@@ -18,8 +18,8 @@ async function startBot() {
     const dbFile = "database.json";
     let db = fs.existsSync(dbFile) ? JSON.parse(fs.readFileSync(dbFile)) : { messages: [], users: {} };
 
-    // Store last message
-    let lastMessage = "";
+    // Define the admin number (replace with actual admin's number)
+    const adminNumber = "admin_number@s.whatsapp.net";
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
         const msg = messages[0];
@@ -28,28 +28,39 @@ async function startBot() {
         const chatId = msg.key.remoteJid;
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
         const sender = msg.key.participant || msg.key.remoteJid;
+        const senderName = msg.pushName || sender.split("@")[0];
 
         // ✅ Save messages to database
         db.messages.push({ sender, text, timestamp: Date.now() });
         fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
 
-        // ✅ Auto-reply to messages
-        if (text.toLowerCase() === "hello") {
-            await sock.sendMessage(chatId, { text: `Hi @${sender.split("@")[0]}`, mentions: [sender] });
-        }
-
-        // ✅ Reject specific messages (example: blocking the word "spam")
-        if (text.toLowerCase().includes("spam")) {
-            await sock.sendMessage(chatId, { text: "❌ This message is not allowed!" });
+        // ✅ Check for greetings and reply
+        const greetings = ["hello", "hi", "hey"];
+        if (greetings.includes(text.toLowerCase())) {
+            await sock.sendMessage(chatId, {
+                text: `Hi @${sender.split("@")[0]}`,
+                mentions: [sender],
+            });
             return;
         }
 
-        // ✅ Store last message (excluding '.tag' command)
-        if (text.toLowerCase() !== ".tag") {
-            lastMessage = text;
+        // ✅ Spam detection system
+        if (detectSpam(text, sender)) {
+            await sock.sendMessage(chatId, {
+                text: `⚠️ Warning @${sender.split("@")[0]}, your message looks like spam!`,
+                mentions: [sender],
+            });
+
+            // Notify admin
+            await sock.sendMessage(adminNumber, {
+                text: `🚨 *Spam Alert!* 🚨\n\nSender: @${sender.split("@")[0]}\nMessage: "${text}"`,
+                mentions: [sender],
+            });
+
+            return;
         }
 
-        // ✅ Check if user is an admin before allowing ".tag"
+        // ✅ Auto-tag everyone (admin-only)
         if (text.toLowerCase() === ".tag") {
             const groupMeta = await sock.groupMetadata(chatId);
             const participants = groupMeta.participants;
@@ -61,11 +72,7 @@ async function startBot() {
             }
 
             const mentions = participants.map(p => p.id);
-            if (lastMessage) {
-                await sock.sendMessage(chatId, { text: `${lastMessage}`, mentions });
-            } else {
-                await sock.sendMessage(chatId, { text: "No previous message to repeat." });
-            }
+            await sock.sendMessage(chatId, { text: `@${sender.split("@")[0]} tagged everyone!`, mentions });
         }
     });
 
@@ -84,6 +91,46 @@ async function startBot() {
             }
         }
     });
+
+    /**
+     * 🛑 Detect Spam Messages Function 🛑
+     */
+    function detectSpam(message, sender) {
+        // ✅ Spam word detection
+        const spamKeywords = ["free money", "click this link", "lottery", "win big", "investment offer"];
+        if (spamKeywords.some(word => message.toLowerCase().includes(word))) return true;
+
+        // ✅ Link detection
+        const linkRegex = /(https?:\/\/[^\s]+)/g;
+        if (linkRegex.test(message)) return true;
+
+        // ✅ Repeated message detection
+        if (!db.users[sender]) {
+            db.users[sender] = { lastMessage: "", repeatCount: 0 };
+        }
+
+        if (db.users[sender].lastMessage === message) {
+            db.users[sender].repeatCount += 1;
+        } else {
+            db.users[sender].repeatCount = 0;
+        }
+        db.users[sender].lastMessage = message;
+
+        if (db.users[sender].repeatCount >= 3) return true;
+
+        // ✅ Excessive emoji & symbols detection
+        const emojiRegex = /[\uD83C-\uDBFF\uDC00-\uDFFF]+/g;
+        const specialCharRegex = /[!@#$%^&*()_+={}\[\]:;"'<>,.?\/\\|`~]/g;
+        const uppercaseRatio = (message.replace(/[^A-Z]/g, "").length / message.length) > 0.7;
+
+        if ((message.match(emojiRegex) || []).length > 5 || // More than 5 emojis
+            (message.match(specialCharRegex) || []).length > 10 || // More than 10 special characters
+            uppercaseRatio) { // Too many uppercase letters
+            return true;
+        }
+
+        return false;
+    }
 }
 
 startBot();
