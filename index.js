@@ -34,7 +34,7 @@ async function startBot() {
 
         // ✅ Auto-reply to messages
         if (text.toLowerCase() === "hello") {
-            await sock.sendMessage(chatId, { text: `Hello @${sender.split("@")[0]}`, mentions: [sender] });
+            await sock.sendMessage(chatId, { text: `Hi @${sender.split("@")[0]}`, mentions: [sender] });
         }
 
         // ✅ Reject specific messages (example: blocking the word "spam")
