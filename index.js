@@ -14,17 +14,13 @@ async function startBot() {
         if (connection === "close") startBot();
     });
 
-    // Load database (JSON file)
+    // Load database
     const dbFile = "database.json";
     let db = fs.existsSync(dbFile) ? JSON.parse(fs.readFileSync(dbFile)) : { messages: [], users: {}, spamFilters: [] };
 
-    // Define admin number
     const adminNumber = "2347040968349@s.whatsapp.net";
-
-    // Store last message per chat
     let lastMessages = {};
 
-    // ✅ Load muted users from file (Persistent Muting)
     const mutedUsersFile = "mutedUsers.json";
     let mutedUsers = new Set(fs.existsSync(mutedUsersFile) ? JSON.parse(fs.readFileSync(mutedUsersFile)) : []);
 
@@ -38,16 +34,13 @@ async function startBot() {
 
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
-        // ✅ Save last message before .tag
-        if (text.toLowerCase() !== ".tag") {
-            lastMessages[chatId] = text;
-        }
+        // Save last message before tagging
+        if (text.toLowerCase() !== ".tag") lastMessages[chatId] = text;
 
-        // ✅ Save messages to database
+        // Save messages to database
         db.messages.push({ sender, text, timestamp: Date.now() });
         fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
 
-        // ✅ Check if user is muted
         if (mutedUsers.has(sender)) {
             console.log(`⛔ Muted user ${sender} sent a message, ignoring.`);
             return;
@@ -60,15 +53,30 @@ async function startBot() {
             return;
         }
 
-        // ✅ Auto-repeat last message with .tag
+        // ✅ Tag all members if admin sends ".tag"
         if (text.toLowerCase() === ".tag") {
-            if (!lastMessages[chatId]) {
-                await sock.sendMessage(chatId, { text: "No previous message found." });
+            if (sender !== adminNumber) {
+                await sock.sendMessage(chatId, { text: "❌ Only admins can use this command!" });
                 return;
             }
-            await sock.sendMessage(chatId, { text: lastMessages[chatId] });
+
+            const groupMetadata = await sock.groupMetadata(chatId).catch(() => null);
+            if (!groupMetadata) {
+                await sock.sendMessage(chatId, { text: "This command only works in groups." });
+                return;
+            }
+
+            const members = groupMetadata.participants.map(member => member.id);
+            const lastMsg = lastMessages[chatId] || "No previous message found.";
+
+            await sock.sendMessage(chatId, {
+                text: lastMsg, // Repeat last message
+                mentions: members, // Invisible tagging
+            });
+
             return;
         }
+
 
         // ✅ Unmute Command (Admin Only)
         if (text.toLowerCase().startsWith(".unmute")) {
@@ -119,9 +127,7 @@ async function startBot() {
         }
 
         // ✅ Detect Spam
-        if (detectSpam(text, sender, chatId, senderName)) {
-            return;
-        }
+        if (detectSpam(text, sender, chatId, senderName)) return;
     });
 
     /**
@@ -149,9 +155,7 @@ async function startBot() {
      * 🚨 Handle Spam Warnings and Auto-Mute 🚨
      */
     async function handleSpam(sender, chatId, message, senderName) {
-        if (!db.users[sender]) {
-            db.users[sender] = { spamWarnings: 0 };
-        }
+        if (!db.users[sender]) db.users[sender] = { spamWarnings: 0 };
 
         db.users[sender].spamWarnings += 1;
         fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
