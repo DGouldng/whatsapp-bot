@@ -16,121 +16,158 @@ async function startBot() {
 
     // Load database (JSON file)
     const dbFile = "database.json";
-    let db = fs.existsSync(dbFile) ? JSON.parse(fs.readFileSync(dbFile)) : { messages: [], users: {} };
+    let db = fs.existsSync(dbFile) ? JSON.parse(fs.readFileSync(dbFile)) : { messages: [], users: {}, spamFilters: [] };
 
-    // Define the admin number (replace with actual admin's number)
-    const adminNumber = "admin_number@s.whatsapp.net";
+    // Define admin number
+    const adminNumber = "2347040968349@s.whatsapp.net";
+
+    // Store last message per chat
+    let lastMessages = {};
+
+    // ✅ Load muted users from file (Persistent Muting)
+    const mutedUsersFile = "mutedUsers.json";
+    let mutedUsers = new Set(fs.existsSync(mutedUsersFile) ? JSON.parse(fs.readFileSync(mutedUsersFile)) : []);
 
     sock.ev.on("messages.upsert", async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
 
         const chatId = msg.key.remoteJid;
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
         const sender = msg.key.participant || msg.key.remoteJid;
         const senderName = msg.pushName || sender.split("@")[0];
+
+        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+
+        // ✅ Save last message before .tag
+        if (text.toLowerCase() !== ".tag") {
+            lastMessages[chatId] = text;
+        }
 
         // ✅ Save messages to database
         db.messages.push({ sender, text, timestamp: Date.now() });
         fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
 
-        // ✅ Check for greetings and reply
+        // ✅ Check if user is muted
+        if (mutedUsers.has(sender)) {
+            console.log(`⛔ Muted user ${sender} sent a message, ignoring.`);
+            return;
+        }
+
+        // ✅ Handle Greetings
         const greetings = ["hello", "hi", "hey"];
         if (greetings.includes(text.toLowerCase())) {
-            await sock.sendMessage(chatId, {
-                text: `Hi @${sender.split("@")[0]}`,
-                mentions: [sender],
-            });
+            await sock.sendMessage(chatId, { text: `Hi ${senderName}` });
             return;
         }
 
-        // ✅ Spam detection system
-        if (detectSpam(text, sender)) {
-            await sock.sendMessage(chatId, {
-                text: `⚠️ Warning @${sender.split("@")[0]}, your message looks like spam!`,
-                mentions: [sender],
-            });
-
-            // Notify admin
-            await sock.sendMessage(adminNumber, {
-                text: `🚨 *Spam Alert!* 🚨\n\nSender: @${sender.split("@")[0]}\nMessage: "${text}"`,
-                mentions: [sender],
-            });
-
-            return;
-        }
-
-        // ✅ Auto-tag everyone (admin-only)
+        // ✅ Auto-repeat last message with .tag
         if (text.toLowerCase() === ".tag") {
-            const groupMeta = await sock.groupMetadata(chatId);
-            const participants = groupMeta.participants;
-            const admins = participants.filter(p => p.admin).map(p => p.id);
+            if (!lastMessages[chatId]) {
+                await sock.sendMessage(chatId, { text: "No previous message found." });
+                return;
+            }
+            await sock.sendMessage(chatId, { text: lastMessages[chatId] });
+            return;
+        }
 
-            if (!admins.includes(sender)) {
-                await sock.sendMessage(chatId, { text: "❌ Only admins can use this command!" });
+        // ✅ Unmute Command (Admin Only)
+        if (text.toLowerCase().startsWith(".unmute")) {
+            if (sender !== adminNumber) {
+                await sock.sendMessage(chatId, { text: "❌ You don't have permission to unmute users!" });
                 return;
             }
 
-            const mentions = participants.map(p => p.id);
-            await sock.sendMessage(chatId, { text: `@${sender.split("@")[0]} tagged everyone!`, mentions });
-        }
-    });
-
-    // ✅ Auto-welcome new members
-    sock.ev.on("group-participants.update", async ({ id, participants, action }) => {
-        if (action === "add") {
-            for (const participant of participants) {
-                await sock.sendMessage(id, {
-                    text: `👋 Welcome @${participant.split("@")[0]} to the group!`,
-                    mentions: [participant],
-                });
-
-                // ✅ Save new user in the database
-                db.users[participant] = { joinedAt: Date.now() };
-                fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
+            const args = text.split(" ");
+            if (args.length < 2) {
+                await sock.sendMessage(chatId, { text: "❌ Please mention a user to unmute." });
+                return;
             }
+
+            const mentionedUser = msg.message.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || args[1] + "@s.whatsapp.net";
+
+            if (mutedUsers.has(mentionedUser)) {
+                mutedUsers.delete(mentionedUser);
+                fs.writeFileSync(mutedUsersFile, JSON.stringify([...mutedUsers], null, 2));
+
+                await sock.sendMessage(chatId, {
+                    text: `✅ @${mentionedUser.split("@")[0]} has been unmuted.`,
+                    mentions: [mentionedUser],
+                });
+            } else {
+                await sock.sendMessage(chatId, {
+                    text: `⚠️ @${mentionedUser.split("@")[0]} is not muted.`,
+                    mentions: [mentionedUser],
+                });
+            }
+            return;
+        }
+
+        // ✅ Custom spam filters
+        if (text.toLowerCase().startsWith(".addspamfilter")) {
+            await addSpamFilter(text, chatId, sender);
+            return;
+        }
+
+        if (text.toLowerCase().startsWith(".removespamfilter")) {
+            await removeSpamFilter(text, chatId, sender);
+            return;
+        }
+
+        if (text.toLowerCase() === ".spamfilters") {
+            await listSpamFilters(chatId);
+            return;
+        }
+
+        // ✅ Detect Spam
+        if (detectSpam(text, sender, chatId, senderName)) {
+            return;
         }
     });
 
     /**
-     * 🛑 Detect Spam Messages Function 🛑
+     * 🛑 Detect Spam Messages, Warn, and Auto-Mute 🛑
      */
-    function detectSpam(message, sender) {
-        // ✅ Spam word detection
+    async function detectSpam(message, sender, chatId, senderName) {
         const spamKeywords = ["free money", "click this link", "lottery", "win big", "investment offer"];
-        if (spamKeywords.some(word => message.toLowerCase().includes(word))) return true;
+        const customSpamFilters = db.spamFilters || [];
 
-        // ✅ Link detection
+        if ([...spamKeywords, ...customSpamFilters].some(word => message.toLowerCase().includes(word))) {
+            await handleSpam(sender, chatId, message, senderName);
+            return true;
+        }
+
         const linkRegex = /(https?:\/\/[^\s]+)/g;
-        if (linkRegex.test(message)) return true;
-
-        // ✅ Repeated message detection
-        if (!db.users[sender]) {
-            db.users[sender] = { lastMessage: "", repeatCount: 0 };
-        }
-
-        if (db.users[sender].lastMessage === message) {
-            db.users[sender].repeatCount += 1;
-        } else {
-            db.users[sender].repeatCount = 0;
-        }
-        db.users[sender].lastMessage = message;
-
-        if (db.users[sender].repeatCount >= 3) return true;
-
-        // ✅ Excessive emoji & symbols detection
-        const emojiRegex = /[\uD83C-\uDBFF\uDC00-\uDFFF]+/g;
-        const specialCharRegex = /[!@#$%^&*()_+={}\[\]:;"'<>,.?\/\\|`~]/g;
-        const uppercaseRatio = (message.replace(/[^A-Z]/g, "").length / message.length) > 0.7;
-
-        if ((message.match(emojiRegex) || []).length > 5 || // More than 5 emojis
-            (message.match(specialCharRegex) || []).length > 10 || // More than 10 special characters
-            uppercaseRatio) { // Too many uppercase letters
+        if (linkRegex.test(message)) {
+            await handleSpam(sender, chatId, message, senderName);
             return true;
         }
 
         return false;
     }
+
+    /**
+     * 🚨 Handle Spam Warnings and Auto-Mute 🚨
+     */
+    async function handleSpam(sender, chatId, message, senderName) {
+        if (!db.users[sender]) {
+            db.users[sender] = { spamWarnings: 0 };
+        }
+
+        db.users[sender].spamWarnings += 1;
+        fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
+
+        const warnings = db.users[sender].spamWarnings;
+
+        if (warnings >= 3) {
+            await sock.sendMessage(chatId, { text: `⛔ ${senderName} has been muted for repeated spamming.` });
+
+            // ✅ Add user to muted list
+            mutedUsers.add(sender);
+            fs.writeFileSync(mutedUsersFile, JSON.stringify([...mutedUsers], null, 2));
+        }
+    }
+
+    console.log("🤖 Bot started!");
 }
 
 startBot();

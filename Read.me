@@ -1,0 +1,4 @@
+node index.js
+pm2 stop whatsapp-bot
+pm2 delete whatsapp-bot
+pm2 start index.js --name whatsapp-bot
